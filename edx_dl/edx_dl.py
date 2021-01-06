@@ -6,6 +6,8 @@ Main module for the edx-dl downloader.
 It corresponds to the cli interface
 """
 
+from __future__ import unicode_literals
+
 import argparse
 import getpass
 import json
@@ -14,9 +16,15 @@ import os
 import pickle
 import re
 import sys
+import enum
 
 from functools import partial
 from multiprocessing.dummy import Pool as ThreadPool
+
+import youtube_dl
+
+from timeit import default_timer as timer
+from tqdm import tqdm
 
 from six.moves.http_cookiejar import CookieJar
 from six.moves.urllib.error import HTTPError, URLError
@@ -100,6 +108,97 @@ EDX_HOMEPAGE = BASE_URL + '/user_api/v1/account/login_session'
 LOGIN_API = BASE_URL + '/login_ajax'
 DASHBOARD = BASE_URL + '/dashboard'
 COURSEWARE_SEL = OPENEDX_SITES['edx']['courseware-selector']
+
+class FileType(enum.Enum):
+   Resource = 1
+   Video = 2
+   Subtitle = 3
+
+failed_downloads = []
+class MyLogger(object):
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        failed_downloads.append(msg)
+
+progress = {
+    'video_count': 0,
+    'video_counter': 0,
+    'video_downloads': 0
+}
+
+pbar_initialized = False
+def my_hook(d):
+    global pbar_video
+    global pbar_initialized
+
+    if d['status'] == 'downloading':
+        if 'total_bytes' not in d or d['total_bytes'] is None:
+            total_bytes = d['total_bytes_estimate']
+        else:
+            total_bytes = d['total_bytes']
+
+        if total_bytes is None or total_bytes == 0:
+            total_bytes = 100
+
+        bytes_downloaded = int(d['downloaded_bytes'])
+
+        if not pbar_initialized:
+            pbar_initialized = True
+            pbar_video = tqdm(
+                total=total_bytes, 
+                desc="File   ", 
+                unit="B", 
+                unit_scale=True, 
+                unit_divisor=1024, 
+                leave=False, 
+                dynamic_ncols=True,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{remaining}, {rate_fmt}]'
+                )
+
+        pbar_video.n = bytes_downloaded
+        pbar_video.refresh()
+    elif d['status'] == 'finished' and pbar_initialized:
+        pbar_initialized = False
+        pbar_video.close()
+
+
+ydl_opts = {
+    'quiet': True,
+    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+    'merge_output_format': 'mp4',
+    'hls_prefer_native': True,
+    'retries': 5,
+    'nooverwrites': True,
+    'prefer_ffmpeg': True,
+    'logger': MyLogger(),
+    'progress_hooks': [my_hook],
+}
+
+ydl_opts_subs = {
+    'quiet': True,
+    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+    'merge_output_format': 'mp4',
+    'hls_prefer_native': True,
+    'retries': 5,
+    'nooverwrites': True,
+    'writesubtitles': True,
+    'allsubtitles': True,
+    'subtitlesformat': 'srt',
+    'prefer_ffmpeg': True,
+    'postprocessors': [{'key': 'FFmpegEmbedSubtitle'}],
+    'logger': MyLogger(),
+    'progress_hooks': [my_hook],
+}
+
+
+def update_progress(file_type):
+    if file_type == FileType.Video:
+        progress['video_counter'] += 1
 
 
 def change_openedx_site(site_name):
@@ -203,10 +302,10 @@ def edx_get_subtitle(url, headers,
             json_object = get_page_contents_as_json(url, headers)
             return edx_json2srt(json_object)
     except URLError as exception:
-        logging.warn('edX subtitles (error: %s)', exception)
+        #logging.warn('edX subtitles (error: %s)', exception)
         return None
     except ValueError as exception:
-        logging.warn('edX subtitles (error: %s)', exception.message)
+        #logging.warn('edX subtitles (error: %s)', exception.message)
         return None
 
 
@@ -249,6 +348,13 @@ def parse_args():
                         '(e.g., https://courses.edx.org/courses/BerkeleyX/CS191x/2013_Spring/info)')
 
     # optional
+    parser.add_argument('-a',
+                        '--all',
+                        dest='select_all_courses',
+                        action='store_true',
+                        default=False,
+                        help='select all available courses for download')
+
     parser.add_argument('-u',
                         '--username',
                         required=True,
@@ -422,7 +528,7 @@ def edx_get_headers():
     logging.info('Building initial headers for future requests.')
 
     headers = {
-        'User-Agent': 'edX-downloader/0.01',
+        'User-Agent': 'Mozilla/5.0',
         'Accept': 'application/json, text/javascript, */*; q=0.01',
         'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
         'Referer': EDX_HOMEPAGE,
@@ -438,11 +544,21 @@ def extract_units(url, headers, file_formats):
     """
     Parses a webpage and extracts its resources e.g. video_url, sub_url, etc.
     """
-    logging.info("Processing '%s'", url)
+
+    end_of_url = url.split("/")[-1]
+    url = "https://courses.edx.org/api/courseware/sequence/" + end_of_url
+
+    #logging.info("Processing '%s'", url)
 
     page = get_page_contents(url, headers)
     page_extractor = get_page_extractor(url)
-    units = page_extractor.extract_units_from_html(page, BASE_URL, file_formats)
+    unit_urls = page_extractor.extract_units_from_html(page, BASE_URL, file_formats)
+
+    units = []
+    for unit_url in unit_urls:
+        unit_page = get_page_contents(unit_url, headers)
+        units.append(page_extractor.extract_unit(unit_page, BASE_URL, file_formats))
+
 
     return units
 
@@ -452,8 +568,8 @@ def extract_all_units_in_sequence(urls, headers, file_formats):
     Returns a dict of all the units in the selected_sections: {url, units}
     sequentially, this is clearer for debug purposes
     """
-    logging.info('Extracting all units information in sequentially.')
-    logging.debug('urls: ' + str(urls))
+    logging.info('Processing units...\n')
+    #logging.debug('urls: ' + str(urls))
 
     units = [extract_units(url, headers, file_formats) for url in urls]
     all_units = dict(zip(urls, units))
@@ -466,8 +582,8 @@ def extract_all_units_in_parallel(urls, headers, file_formats):
     Returns a dict of all the units in the selected_sections: {url, units}
     in parallel
     """
-    logging.info('Extracting all units information in parallel.')
-    logging.debug('urls: ' + str(urls))
+    logging.info('Processing units...\n')
+    #logging.debug('urls: ' + str(urls))
 
     mapfunc = partial(extract_units, file_formats=file_formats, headers=headers)
     pool = ThreadPool(16)
@@ -506,7 +622,7 @@ def _filter_sections(index, sections):
         try:
             index = int(index)
             if index > 0 and index <= num_sections:
-                logging.info('Sections filtered to: %d', index)
+                logging.info('Sections filtered to: %d\n', index)
                 return [sections[index - 1]]
             else:
                 pass  # log some info here
@@ -522,12 +638,12 @@ def _display_sections(sections):
     """
     Displays a tree of section(s) and subsections
     """
-    logging.info('Downloading %d section(s)', len(sections))
-
     for section in sections:
         logging.info('Section %2d: %s', section.position, section.name)
         for subsection in section.subsections:
             logging.info('  %s', subsection.name)
+
+    logging.info('')
 
 
 def parse_courses(args, available_courses):
@@ -539,16 +655,22 @@ def parse_courses(args, available_courses):
         exit(ExitCode.OK)
 
     if len(args.course_urls) == 0:
-        logging.error('You must pass the URL of at least one course, check the correct url with --list-courses')
-        exit(ExitCode.MISSING_COURSE_URL)
+        if args.select_all_courses:
+            selected_courses = available_courses
+        else:
+            logging.error('You must pass the URL of at least one course, check the correct url with --list-courses')
+            exit(ExitCode.MISSING_COURSE_URL)
+    else:
+        args.select_all_courses = False
+        selected_courses = [available_course
+                            for available_course in available_courses
+                            for url in args.course_urls
+                            if available_course.url == url]
 
-    selected_courses = [available_course
-                        for available_course in available_courses
-                        for url in args.course_urls
-                        if available_course.url == url]
     if len(selected_courses) == 0:
         logging.error('You have not passed a valid course url, check the correct url with --list-courses')
         exit(ExitCode.INVALID_COURSE_URL)
+
     return selected_courses
 
 
@@ -742,16 +864,22 @@ def download_youtube_url(url, filename, headers, args):
     """
     Downloads a youtube URL and applies the filters from args
     """
-    logging.info('Downloading video with URL %s from YouTube.', url)
-    video_format_option = args.format + '/mp4' if args.format else 'mp4'
-    cmd = YOUTUBE_DL_CMD + ['-o', filename, '-f', video_format_option]
 
     if args.subtitles:
-        cmd.append('--all-subs')
-    cmd.extend(args.youtube_dl_options.split())
-    cmd.append(url)
+        opts = ydl_opts_subs
+    else:
+        opts = ydl_opts
 
-    execute_command(cmd, args)
+    if args.format:
+        opts['format'] = args.format + '/' + opts['format']
+
+    if args.ignore_errors:
+        opts['ignoreerrors'] = True
+
+    opts['outtmpl'] = filename
+
+    with youtube_dl.YoutubeDL(opts) as ydl:
+        ydl.download([url])
 
 
 def download_subtitle(url, filename, headers, args):
@@ -765,41 +893,40 @@ def download_subtitle(url, filename, headers, args):
             f.write(subs_string.encode('utf-8'))
 
 
-def skip_or_download(downloads, headers, args, f=download_url):
+def skip_or_download(downloads, file_type, headers, args, f=download_url):
     """
     downloads url into filename using download function f,
     if filename exists it skips
     """
+
     for url, filename in downloads.items():
         if os.path.exists(filename):
-            logging.info('[skipping] %s => %s', url, filename)
             continue
-        else:
-            logging.info('[download] %s => %s', url, filename)
+
+        update_progress(file_type)
+
         if args.dry_run:
             continue
-        f(url, filename, headers, args)
 
+        f(url, filename, headers, args)
 
 def download_video(video, args, target_dir, filename_prefix, headers):
     if args.prefer_cdn_videos or video.video_youtube_url is None:
-        mp4_downloads = _build_url_downloads(video.mp4_urls, target_dir,
-                                             filename_prefix)
-        skip_or_download(mp4_downloads, headers, args)
+        mp4_downloads = _build_url_downloads(video.mp4_urls, target_dir, filename_prefix)
+        skip_or_download(mp4_downloads, FileType.Video, headers, args)
     else:
         if video.video_youtube_url is not None:
             youtube_downloads = _build_url_downloads([video.video_youtube_url],
                                                      target_dir,
                                                      filename_prefix)
-            skip_or_download(youtube_downloads, headers, args)
+            skip_or_download(youtube_downloads, FileType.Video, headers, args)
 
     # the behavior with subtitles is different, since the subtitles don't know
     # the destination name until the video is downloaded with youtube-dl
     # also, subtitles must be transformed from the raw data to the srt format
     if args.subtitles:
-        sub_downloads = _build_subtitles_downloads(video, target_dir,
-                                                   filename_prefix, headers)
-        skip_or_download(sub_downloads, headers, args, download_subtitle)
+        sub_downloads = _build_subtitles_downloads(video, target_dir, filename_prefix, headers)
+        skip_or_download(sub_downloads, FileType.Subtitle, headers, args, download_subtitle)
 
 
 def download_unit(unit, args, target_dir, filename_prefix, headers):
@@ -807,9 +934,9 @@ def download_unit(unit, args, target_dir, filename_prefix, headers):
     Downloads the urls in unit based on args in the given target_dir
     with filename_prefix
     """
+
     if len(unit.videos) == 1:
-        download_video(unit.videos[0], args, target_dir, filename_prefix,
-                       headers)
+        download_video(unit.videos[0], args, target_dir, filename_prefix, headers)
     else:
         # we change the filename_prefix to avoid conflicts when downloading
         # subtitles
@@ -817,24 +944,52 @@ def download_unit(unit, args, target_dir, filename_prefix, headers):
             new_prefix = filename_prefix + ('-%02d' % i)
             download_video(video, args, target_dir, new_prefix, headers)
 
-    res_downloads = _build_url_downloads(unit.resources_urls, target_dir,
-                                         filename_prefix)
-    skip_or_download(res_downloads, headers, args)
+    res_downloads = _build_url_downloads(unit.resources_urls, target_dir, filename_prefix)
+    skip_or_download(res_downloads, FileType.Resource, headers, args)
+
+
+def get_section_count(selections, all_units):
+    count = 0
+
+    for selected_course, selected_sections in selections.items():
+        for selected_section in selected_sections:
+            count += len(selected_section.subsections)
+
+    return count
+
+
+def get_video_count(selections, all_units):
+    count = 0
+
+    for selected_course, selected_sections in selections.items():
+        for selected_section in selected_sections:
+            for subsection in selected_section.subsections:
+                units = all_units.get(subsection.url, [])
+                for unit in units:
+                    count += len(unit.videos)
+
+    return count
 
 
 def download(args, selections, all_units, headers):
     """
     Downloads all the resources based on the selections
     """
-    logging.info("Output directory: " + args.output_dir)
+
+    global pbar_initialized
+    global pbar_video
+
+    logging.info("Output directory: " + args.output_dir + "\n")
+
+    progress['video_count'] = get_video_count(selections, all_units)
 
     # Download Videos
     # notice that we could iterate over all_units, but we prefer to do it over
     # sections/subsections to add correct prefixes and show nicer information.
 
-    for selected_course, selected_sections in selections.items():
+    for selected_course, selected_sections in tqdm(selections.items(), desc="Course ", leave=False, dynamic_ncols=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}'):
         coursename = directory_name(selected_course.name)
-        for selected_section in selected_sections:
+        for selected_section in tqdm(selected_sections, desc="Section", leave=False, dynamic_ncols=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{remaining}]'):
             section_dirname = "%02d-%s" % (selected_section.position,
                                            selected_section.name)
             target_dir = os.path.join(args.output_dir, coursename,
@@ -843,11 +998,19 @@ def download(args, selections, all_units, headers):
             counter = 0
             for subsection in selected_section.subsections:
                 units = all_units.get(subsection.url, [])
-                for unit in units:
+                for unit in tqdm(units, desc="Unit   ", leave=False, dynamic_ncols=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{remaining}]'):
                     counter += 1
                     filename_prefix = "%02d" % counter
-                    download_unit(unit, args, target_dir, filename_prefix,
-                                  headers)
+                    download_unit(unit, args, target_dir, filename_prefix, headers)
+
+    if pbar_initialized:
+        pbar_initialized = False
+        pbar_video.close()
+    
+    #logging.info("\nVideo files downloaded: %d\n", progress['video_counter'])
+    if len(failed_downloads) > 0:
+        logging.info("The following errors were encountered:")
+        logging.info(failed_downloads)
 
 
 def remove_repeated_urls(all_units):
@@ -1078,4 +1241,9 @@ if __name__ == '__main__':
         main()
     except KeyboardInterrupt:
         logging.warn("\n\nCTRL-C detected, shutting down....")
+
+        if pbar_initialized:
+            pbar_initialized = False
+            pbar_video.close()
+
         sys.exit(ExitCode.OK)
